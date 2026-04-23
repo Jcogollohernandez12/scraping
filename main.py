@@ -305,12 +305,21 @@ def extract(
         console.print("[red]Failed to fetch page.[/red]")
         raise typer.Exit(1)
 
+    def _to_str(val):
+        if hasattr(val, 'attrib'):
+            attrib = getattr(val, 'attrib', {}) or {}
+            text = " ".join(val.css("::text").get_all()).strip()
+            return text or str(val)
+        return str(val) if val is not None else ""
+
     data: dict = {}
 
     if css:
-        data["results"] = page.css(css).getall()
+        raw = page.css(css).get_all()
+        data["results"] = [_to_str(r) for r in raw]
     elif xpath:
-        data["results"] = page.xpath(xpath).getall()
+        raw = page.xpath(xpath).get_all()
+        data["results"] = [_to_str(r) for r in raw]
     else:
         from scraper.extractor import Extractor
         ex = Extractor(page)
@@ -320,9 +329,6 @@ def extract(
 
     out = Path(output_file)
     out.parent.mkdir(parents=True, exist_ok=True)
-
-    suffix = out.suffix.lstrip(".") or "json"
-    exporter = Exporter(str(out.parent))
 
     import json as _json
     out.write_text(_json.dumps(data, ensure_ascii=False, indent=2))
@@ -370,6 +376,220 @@ def install():
     console.print("[cyan]Installing Camoufox browser...[/cyan]")
     subprocess.run([sys.executable, "-m", "camoufox", "fetch"], check=False)
     console.print("[green]All browsers installed![/green]")
+
+
+# ── A) Full structured extraction ─────────────────────────────────────────────
+@app.command()
+def full(
+    url: str = typer.Argument(..., help="URL to extract fully"),
+    strategy: str = typer.Option("dynamic", "--strategy", "-s"),
+    output: str = typer.Option("json", "--output", "-o", help="json | jsonl | csv | all"),
+    monitor: bool = typer.Option(False, "--monitor", "-m", help="Compare with previous snapshot"),
+):
+    """[A] Extract ALL structured content: headings, sections, links, images, forms, JSON-LD."""
+    _print_banner()
+    cfg = _load_config()
+    from scraper.smart_fetcher import SmartFetcher
+    from scraper.full_extractor import extract_full
+    from scraper.exporter import Exporter
+
+    console.print(f"\n[bold]Full extraction[/bold] → {url}")
+    fetcher = SmartFetcher(strategy=strategy, config=cfg)
+    page = fetcher.fetch(url)
+    data = extract_full(page)
+
+    if monitor:
+        from scraper.monitor import take_snapshot, compare_snapshots, print_diff_report
+        diff = compare_snapshots(url, data)
+        print_diff_report(diff)
+        take_snapshot(url, data)
+
+    _display_result({k: v for k, v in data.items() if k != "full_text"})
+    Exporter(cfg.get("defaults", {}).get("output_dir", "./output")).save(data, url, fmt=output)
+    fetcher.close()
+
+
+# ── B) Deep crawl ─────────────────────────────────────────────────────────────
+@app.command()
+def crawl(
+    url: str = typer.Argument(..., help="Seed URL to crawl from"),
+    strategy: str = typer.Option("dynamic", "--strategy", "-s"),
+    max_pages: int = typer.Option(20, "--max-pages", "-m", help="Max pages to visit"),
+    delay: float = typer.Option(0.5, "--delay", "-d"),
+    output: str = typer.Option("json", "--output", "-o"),
+    business: bool = typer.Option(False, "--business", help="Also run business extraction on each page"),
+):
+    """[B] Deep crawl: follow ALL internal links and extract data from every page."""
+    _print_banner()
+    cfg = _load_config()
+    from scraper.deep_crawler import deep_crawl
+    from scraper.exporter import Exporter
+
+    extract_fn = None
+    if business:
+        from scraper.full_extractor import extract_full
+        from scraper.business_extractor import extract_business
+        def extract_fn(page):
+            data = extract_full(page)
+            data["business"] = extract_business(page)
+            return data
+
+    console.print(f"\n[bold]Deep crawl[/bold] → {url}  [dim](max {max_pages} pages)[/dim]")
+    result = deep_crawl(url, strategy=strategy, max_pages=max_pages, delay=delay,
+                        extract_fn=extract_fn, config=cfg)
+
+    stats = result["stats"]
+    console.print(f"\n[bold green]Done![/bold green] {stats['total_pages']} pages | {stats['errors']} errors | {stats['duration_seconds']}s")
+
+    table = Table(title="Sitemap", show_lines=True)
+    table.add_column("URL", style="cyan", overflow="fold")
+    table.add_column("Title", style="white")
+    table.add_column("Links", justify="right")
+    for entry in result["sitemap"][:30]:
+        table.add_row(entry["url"][:80], entry.get("title", "")[:50], str(entry.get("internal_links_found", 0)))
+    console.print(table)
+
+    Exporter(cfg.get("defaults", {}).get("output_dir", "./output")).save(result, url, fmt=output)
+
+
+# ── C) Business data extraction ───────────────────────────────────────────────
+@app.command()
+def business(
+    url: str = typer.Argument(..., help="URL to extract business data from"),
+    strategy: str = typer.Option("dynamic", "--strategy", "-s"),
+    output: str = typer.Option("json", "--output", "-o"),
+):
+    """[C] Extract business data: prices, services, team, testimonials, FAQs, contact."""
+    _print_banner()
+    cfg = _load_config()
+    from scraper.smart_fetcher import SmartFetcher
+    from scraper.business_extractor import extract_business
+    from scraper.exporter import Exporter
+
+    console.print(f"\n[bold]Business extraction[/bold] → {url}")
+    fetcher = SmartFetcher(strategy=strategy, config=cfg)
+    page = fetcher.fetch(url)
+    data = extract_business(page)
+    data["_url"] = url
+
+    _display_result(data)
+    Exporter(cfg.get("defaults", {}).get("output_dir", "./output")).save(data, url, fmt=output)
+    fetcher.close()
+
+
+# ── D) Change monitor ─────────────────────────────────────────────────────────
+@app.command()
+def monitor(
+    url: str = typer.Argument(..., help="URL to monitor for changes"),
+    strategy: str = typer.Option("dynamic", "--strategy", "-s"),
+    list_snaps: bool = typer.Option(False, "--list", "-l", help="List all saved snapshots"),
+):
+    """[D] Monitor changes: compare current page with previous snapshot."""
+    _print_banner()
+    cfg = _load_config()
+    from scraper.monitor import take_snapshot, compare_snapshots, print_diff_report, list_snapshots
+
+    if list_snaps:
+        snaps = list_snapshots(url if url != "list" else None)
+        table = Table(title="Saved Snapshots")
+        table.add_column("File", style="cyan")
+        table.add_column("URL", style="dim", overflow="fold")
+        table.add_column("Timestamp")
+        table.add_column("Hash", style="dim")
+        for s in snaps:
+            table.add_row(s["file"], s["url"][:60], s["timestamp"], s["hash"])
+        console.print(table)
+        return
+
+    from scraper.smart_fetcher import SmartFetcher
+    from scraper.full_extractor import extract_full
+    from scraper.business_extractor import extract_business
+
+    console.print(f"\n[bold]Monitoring[/bold] → {url}")
+    fetcher = SmartFetcher(strategy=strategy, config=cfg)
+    page = fetcher.fetch(url)
+    data = extract_full(page)
+    data["business"] = extract_business(page)
+
+    diff = compare_snapshots(url, data)
+    print_diff_report(diff)
+    take_snapshot(url, data)
+    fetcher.close()
+
+
+# ── E) Network interceptor ────────────────────────────────────────────────────
+@app.command()
+def intercept(
+    url: str = typer.Argument(..., help="URL to intercept network traffic"),
+    output: str = typer.Option("json", "--output", "-o"),
+    all_requests: bool = typer.Option(False, "--all", help="Capture all requests, not just API"),
+    wait: int = typer.Option(5, "--wait", "-w", help="Extra seconds to wait after page load"),
+    headless: bool = typer.Option(True, "--headless/--no-headless"),
+):
+    """[E] Intercept ALL network requests: API calls, JSON responses, GraphQL, auth tokens."""
+    _print_banner()
+    cfg = _load_config()
+    from scraper.network_interceptor import intercept as do_intercept, print_network_report
+    from scraper.exporter import Exporter
+
+    console.print(f"\n[bold]Network interception[/bold] → {url}")
+    data = do_intercept(url, headless=headless, wait_seconds=wait,
+                        filter_api_only=not all_requests)
+    print_network_report(data)
+    Exporter(cfg.get("defaults", {}).get("output_dir", "./output")).save(data, url, fmt=output)
+
+
+# ── Combined: run A+B+C+D+E all at once ──────────────────────────────────────
+@app.command()
+def deep(
+    url: str = typer.Argument(..., help="URL — runs all 5 extraction modes"),
+    strategy: str = typer.Option("dynamic", "--strategy", "-s"),
+    max_pages: int = typer.Option(10, "--max-pages", "-m"),
+    output: str = typer.Option("all", "--output", "-o"),
+):
+    """[ALL] Run full + business + crawl + monitor + intercept on a single URL."""
+    _print_banner()
+    cfg = _load_config()
+    from scraper.smart_fetcher import SmartFetcher
+    from scraper.full_extractor import extract_full
+    from scraper.business_extractor import extract_business
+    from scraper.monitor import take_snapshot, compare_snapshots, print_diff_report
+    from scraper.network_interceptor import intercept as do_intercept, print_network_report
+    from scraper.deep_crawler import deep_crawl
+    from scraper.exporter import Exporter
+
+    exporter = Exporter(cfg.get("defaults", {}).get("output_dir", "./output"))
+    fetcher = SmartFetcher(strategy=strategy, config=cfg)
+
+    console.rule("[bold cyan]A) Full structured extraction[/bold cyan]")
+    page = fetcher.fetch(url)
+    full_data = extract_full(page)
+    exporter.save(full_data, url + "_full", fmt=output)
+
+    console.rule("[bold cyan]C) Business data[/bold cyan]")
+    biz_data = extract_business(page)
+    biz_data["_url"] = url
+    _display_result(biz_data)
+    exporter.save(biz_data, url + "_business", fmt=output)
+
+    console.rule("[bold cyan]D) Change monitoring[/bold cyan]")
+    combined = {**full_data, "business": biz_data}
+    diff = compare_snapshots(url, combined)
+    print_diff_report(diff)
+    take_snapshot(url, combined)
+
+    console.rule("[bold cyan]E) Network interception[/bold cyan]")
+    net_data = do_intercept(url, headless=True, wait_seconds=5)
+    print_network_report(net_data)
+    exporter.save(net_data, url + "_network", fmt=output)
+
+    console.rule("[bold cyan]B) Deep crawl[/bold cyan]")
+    crawl_result = deep_crawl(url, strategy=strategy, max_pages=max_pages,
+                               delay=0.5, config=cfg)
+    exporter.save(crawl_result, url + "_crawl", fmt=output)
+
+    fetcher.close()
+    console.rule("[bold green]All done![/bold green]")
 
 
 # ──────────────────────────────────────────────────────────────────────────────

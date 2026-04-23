@@ -86,9 +86,9 @@ def run_spider(
 
             for field, selector in selectors.items():
                 if selector.startswith("//") or selector.startswith("(//"):
-                    values = response.xpath(selector).getall()
+                    values = response.xpath(selector).get_all()
                 else:
-                    values = response.css(selector).getall()
+                    values = response.css(selector).get_all()
                 item[field] = values[0] if len(values) == 1 else values
 
             if on_item:

@@ -65,7 +65,7 @@ class Extractor:
             else:
                 elements = self.page.css(selector)
 
-        raw = elements.getall() if multiple else [elements.get()]
+        raw = elements.get_all() if multiple else [elements.get()]
         raw = [r for r in raw if r is not None]
 
         if regex:
@@ -86,13 +86,14 @@ class Extractor:
 
     def extract_all_text(self) -> list[str]:
         """Extract all visible text nodes."""
-        return self.page.css("*::text").getall()
+        return self.page.css("*::text").get_all()
 
     def extract_links(self) -> list[dict]:
         """Extract all anchor tags with href and text."""
         links = []
         for a in self.page.css("a"):
-            href = a.attrib.get("href", "")
+            attrib = getattr(a, 'attrib', {}) or {}
+            href = attrib.get("href", "")
             text = a.css("::text").get() or ""
             if href:
                 links.append({"text": text.strip(), "href": href.strip()})
@@ -102,8 +103,9 @@ class Extractor:
         """Extract all images with src and alt."""
         images = []
         for img in self.page.css("img"):
-            src = img.attrib.get("src", "") or img.attrib.get("data-src", "")
-            alt = img.attrib.get("alt", "")
+            attrib = getattr(img, 'attrib', {}) or {}
+            src = attrib.get("src", "") or attrib.get("data-src", "")
+            alt = attrib.get("alt", "")
             if src:
                 images.append({"src": src.strip(), "alt": alt.strip()})
         return images
@@ -127,8 +129,20 @@ class Extractor:
     def extract_meta(self) -> dict:
         """Extract common page metadata."""
         def _get(selector):
-            el = self.page.css(selector)
-            return el.attrib.get("content", "") if el else ""
+            els = self.page.css(selector)
+            if not els:
+                return ""
+            el = els[0] if hasattr(els, '__getitem__') else els
+            attrib = getattr(el, 'attrib', {}) or {}
+            return attrib.get("content", "")
+
+        def _attr(selector, attr):
+            els = self.page.css(selector)
+            if not els:
+                return ""
+            el = els[0] if hasattr(els, '__getitem__') else els
+            attrib = getattr(el, 'attrib', {}) or {}
+            return attrib.get(attr, "")
 
         return {
             "title": self.page.css("title::text").get(""),
@@ -136,7 +150,7 @@ class Extractor:
             "og_title": _get('meta[property="og:title"]'),
             "og_description": _get('meta[property="og:description"]'),
             "og_image": _get('meta[property="og:image"]'),
-            "canonical": self.page.css('link[rel="canonical"]').attrib.get("href", "") if self.page.css('link[rel="canonical"]') else "",
+            "canonical": _attr('link[rel="canonical"]', "href"),
         }
 
     def find_by_text(self, text: str, tag: str = "*") -> list[str]:
