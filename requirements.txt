@@ -3,3 +3,4 @@ rich
 typer
 pyyaml
 python-dotenv
+requests

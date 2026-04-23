@@ -14,9 +14,10 @@
 4. [Comandos básicos](#4-comandos-básicos)
 5. [Comandos avanzados A–E](#5-comandos-avanzados-ae)
 6. [Caso real: CMCSA Yahoo Finance](#6-caso-real-cmcsa-yahoo-finance)
-7. [Referencia de selectores](#7-referencia-de-selectores)
-8. [Formatos de exportación](#8-formatos-de-exportación)
-9. [Errores comunes y soluciones](#9-errores-comunes-y-soluciones)
+7. [LinkedIn — Health Tech Scraping](#7-linkedin--health-tech-scraping)
+8. [Referencia de selectores](#8-referencia-de-selectores)
+9. [Formatos de exportación](#9-formatos-de-exportación)
+10. [Errores comunes y soluciones](#10-errores-comunes-y-soluciones)
 
 ---
 
@@ -448,7 +449,485 @@ python3 main.py full "https://finance.yahoo.com/quote/CMCSA/analysis" \
 
 ---
 
-## 7. Referencia de selectores
+## 7. LinkedIn — Health Tech Scraping
+
+Cuatro comandos especializados para extraer datos de LinkedIn con foco en
+**lead generation**, **market research** y **recruiting** en el sector health tech.
+
+---
+
+### Gratuitos — requieren tu cuenta de LinkedIn
+
+> Correr `linkedin-login` una sola vez y los demás comandos funcionan solos.
+
+| Comando | Qué hace |
+|---|---|
+| `linkedin-login` | Inicia sesión y guarda cookies para los demás comandos |
+| `linkedin-companies` | Busca empresas health tech por keyword, industria y ubicación |
+| `linkedin-people` | Busca personas, filtra por título y seniority, pipeline de recruiting |
+
+### De pago — requieren API key de Proxycurl
+
+> Registrarse en [nubela.co/proxycurl](https://nubela.co/proxycurl) → copiar API key → agregar `PROXYCURL_API_KEY=...` en `.env`.
+> Costo: ~$0.01 USD por crédito. Tienen créditos gratuitos al registrarse.
+> Ventaja: sin browser, sin riesgo de bloqueo, incluye email/teléfono y datos de funding.
+
+| Comando | Qué hace |
+|---|---|
+| `linkedin-proxycurl company-search` | Busca empresas por keyword vía API |
+| `linkedin-proxycurl person-search` | Busca personas por keyword y título vía API |
+| `linkedin-proxycurl company` | Perfil completo de una empresa por URL |
+| `linkedin-proxycurl person` | Perfil completo de una persona por URL |
+| `linkedin-proxycurl employees` | Lista empleados de una empresa |
+
+### ¿Cuál usar?
+
+| Situación | Comando recomendado |
+|---|---|
+| Empezar rápido, sin costo | `linkedin-companies` / `linkedin-people` |
+| LinkedIn bloquea o pide captcha | `linkedin-proxycurl` |
+| Necesito email o teléfono del contacto | `linkedin-proxycurl person-search --enrich` |
+| Necesito datos de funding de empresas | `linkedin-proxycurl company-search --funding` |
+| Buscar empleados dentro de una empresa | `linkedin-proxycurl employees` |
+| Volumen alto (+500 perfiles/día) | `linkedin-proxycurl` |
+
+---
+
+---
+
+### Paso 0 — Setup inicial (hacer una sola vez)
+
+Copiar el archivo de variables de entorno:
+
+```bash
+cp .env.example .env
+```
+
+El archivo `.env` es donde viven todas las credenciales. Nunca se sube al repo (está en `.gitignore`).
+
+---
+
+### `linkedin-login` — guardar sesión
+
+Abre un browser, hace login en LinkedIn y guarda las cookies en `.env` y `cookies/linkedin.json`
+para que todos los demás comandos las usen automáticamente.
+
+```bash
+# Opción A — login automático (recomendado)
+python3 main.py linkedin-login --email tu@email.com --password tupassword
+
+# Opción B — login manual (tú haces login en el browser que se abre)
+python3 main.py linkedin-login
+```
+
+Después de correr esto una vez **no necesitas volver a hacerlo** mientras la sesión esté activa
+(~1 año). Si LinkedIn te pide verificación de seguridad durante el login, el programa te avisa
+para que la completes en el browser y luego presiones Enter.
+
+**Flags disponibles:**
+
+| Flag | Corto | Descripción | Default |
+|---|---|---|---|
+| `--email` | `-e` | Email de LinkedIn | — |
+| `--password` | `-p` | Password de LinkedIn | — |
+| `--save / --no-save` | | Guardar cookies en `.env` y `cookies/linkedin.json` | `--save` |
+
+> **Alternativa sin login:** puedes poner la cookie directamente en `.env`:
+> ```env
+> LINKEDIN_LI_AT=AQEDARxxxxxxxxxxxxxxxxxxxxxxxx
+> ```
+> Obtén el valor desde Chrome → DevTools → Application → Cookies → `linkedin.com` → `li_at`.
+
+---
+
+### `linkedin-companies` — buscar empresas
+
+Busca empresas en LinkedIn usando la API interna Voyager (intercepción de red).
+Útil para **market research**: mapear competidores, encontrar empresas para partnerships o inversión.
+
+```bash
+# Básico
+python3 main.py linkedin-companies "digital health"
+python3 main.py linkedin-companies "telehealth"
+python3 main.py linkedin-companies "salud digital"
+
+# Por ubicación
+python3 main.py linkedin-companies "digital health" --location usa
+python3 main.py linkedin-companies "telehealth" --location mexico
+python3 main.py linkedin-companies "health tech" --location latam
+python3 main.py linkedin-companies "mental health" --location colombia
+
+# Por industria (se pueden combinar con coma)
+python3 main.py linkedin-companies "biotech" --industries biotechnology
+python3 main.py linkedin-companies "medtech" --industries biotechnology,medical_devices
+python3 main.py linkedin-companies "health app" --industries hospital_healthcare,health_wellness_fitness
+
+# Cuántos resultados
+python3 main.py linkedin-companies "digital health" --count 50
+
+# Enriquecer cada empresa con perfil completo (website, tamaño, descripción, fundación)
+python3 main.py linkedin-companies "health tech" --enrich
+
+# Exportar en distintos formatos
+python3 main.py linkedin-companies "health tech" --output csv
+python3 main.py linkedin-companies "health tech" --output all   # json + csv + jsonl
+
+# Ejemplo completo
+python3 main.py linkedin-companies "mental health app" \
+  --industries mental_health,health_wellness_fitness \
+  --location latam \
+  --count 50 \
+  --enrich \
+  --output csv
+```
+
+**Flags disponibles:**
+
+| Flag | Corto | Descripción | Default |
+|---|---|---|---|
+| `--industries` | `-i` | Industrias separadas por coma (ver tabla abajo) | todas las health |
+| `--location` | `-l` | Ubicación geográfica (ver tabla abajo) | sin filtro |
+| `--count` | `-n` | Número de empresas a buscar | `25` |
+| `--enrich` | `-e` | Fetch perfil completo de cada empresa | `false` |
+| `--output` | `-o` | Formato: `json` \| `jsonl` \| `csv` \| `all` | `json` |
+| `--headless / --no-headless` | | Correr browser en segundo plano | `--no-headless` |
+
+**Valores de `--location`:**
+
+| Clave | País / Región |
+|---|---|
+| `usa` | Estados Unidos |
+| `latam` | Latinoamérica |
+| `mexico` | México |
+| `colombia` | Colombia |
+| `brazil` | Brasil |
+| `uk` | Reino Unido |
+| `spain` | España |
+
+**Valores de `--industries`:**
+
+| Clave | Industria en LinkedIn |
+|---|---|
+| `hospital_healthcare` | Hospital & Health Care |
+| `health_wellness_fitness` | Health, Wellness and Fitness |
+| `biotechnology` | Biotechnology |
+| `pharmaceuticals` | Pharmaceuticals |
+| `medical_devices` | Medical Devices |
+| `mental_health` | Mental Health Care |
+| `medical_practice` | Medical Practice |
+| `research` | Research |
+
+**Campos en el output:**
+
+| Campo | Siempre | Con `--enrich` |
+|---|---|---|
+| `name` | ✅ | ✅ |
+| `linkedin_url` | ✅ | ✅ |
+| `company_id` | ✅ | ✅ |
+| `industry_size` | ✅ | ✅ |
+| `location` | ✅ | ✅ |
+| `description` | | ✅ |
+| `website` | | ✅ |
+| `employee_count` | | ✅ |
+| `headquarters` | | ✅ |
+| `founded` | | ✅ |
+| `specialties` | | ✅ |
+| `followers` | | ✅ |
+
+---
+
+### `linkedin-people` — buscar personas / recruiting
+
+Busca profesionales de health tech. Útil para **recruiting** (CTOs, ingenieros, médicos tech)
+y **lead generation** (founders, decision-makers en empresas target).
+
+```bash
+# Básico
+python3 main.py linkedin-people "digital health"
+python3 main.py linkedin-people "telemedicine"
+
+# Por título de trabajo
+python3 main.py linkedin-people "digital health" --titles "CTO,Founder,CEO"
+python3 main.py linkedin-people "health tech" --titles "VP Engineering,Director of Engineering"
+python3 main.py linkedin-people "healthtech" --titles "Product Manager,CPO"
+python3 main.py linkedin-people "telemedicine" --titles "Software Engineer,Backend Engineer"
+
+# Por seniority (sin especificar títulos exactos)
+python3 main.py linkedin-people "digital health" --seniority "c_suite,vp"
+python3 main.py linkedin-people "health tech" --seniority "director,manager"
+python3 main.py linkedin-people "health app" --seniority "senior"
+
+# Por ubicación
+python3 main.py linkedin-people "digital health" --location usa
+python3 main.py linkedin-people "salud digital" --location mexico
+python3 main.py linkedin-people "health tech" --location latam
+
+# Cuántos resultados
+python3 main.py linkedin-people "digital health" --count 50
+
+# Enriquecer perfiles (agrega experiencia completa, empresa actual, resumen)
+python3 main.py linkedin-people "health tech" --titles "CTO" --enrich
+
+# Pipeline completo de recruiting (busca + enriquece + ordena por score de seniority)
+python3 main.py linkedin-people "digital health" --recruiting
+python3 main.py linkedin-people "telehealth" --recruiting --count 30 --output csv
+
+# Exportar
+python3 main.py linkedin-people "health tech" --output csv
+python3 main.py linkedin-people "health tech" --output all
+
+# Ejemplo completo
+python3 main.py linkedin-people "digital health" \
+  --titles "CTO,Founder,CEO" \
+  --seniority "c_suite,vp" \
+  --location usa \
+  --count 40 \
+  --output csv
+```
+
+**Flags disponibles:**
+
+| Flag | Corto | Descripción | Default |
+|---|---|---|---|
+| `--titles` | `-t` | Títulos separados por coma | `CTO,Founder,CEO` |
+| `--seniority` | `-s` | Nivel de seniority (ver tabla abajo) | `c_suite,vp,director` |
+| `--location` | `-l` | Ubicación geográfica (mismas claves que companies) | sin filtro |
+| `--count` | `-n` | Número de perfiles a buscar | `25` |
+| `--enrich` | `-e` | Fetch perfil completo de cada persona | `false` |
+| `--recruiting` | | Pipeline completo: busca + enriquece + score | `false` |
+| `--output` | `-o` | Formato: `json` \| `jsonl` \| `csv` \| `all` | `json` |
+| `--headless / --no-headless` | | Correr browser en segundo plano | `--no-headless` |
+
+**Valores de `--seniority`:**
+
+| Clave | Nivel |
+|---|---|
+| `c_suite` | CEO, CTO, CMO, CFO, etc. |
+| `vp` | Vice President |
+| `director` | Director |
+| `manager` | Manager |
+| `senior` | Senior |
+| `entry` | Entry level |
+
+**`outreach_priority` score** (calculado con `--recruiting`):
+
+| Score | Roles |
+|---|---|
+| 10 | CEO, CTO, Founder, Co-Founder |
+| 9 | COO, CPO, President |
+| 8 | CMO, CIO, VP |
+| 7 | Director, Head of |
+| 6 | Lead, Principal |
+| 5 | Senior |
+
+**Campos en el output:**
+
+| Campo | Siempre | Con `--enrich` | Con `--recruiting` |
+|---|---|---|---|
+| `name` | ✅ | ✅ | ✅ |
+| `headline` | ✅ | ✅ | ✅ |
+| `location` | ✅ | ✅ | ✅ |
+| `linkedin_url` | ✅ | ✅ | ✅ |
+| `snippet` | ✅ | ✅ | ✅ |
+| `summary` | | ✅ | ✅ |
+| `current_title` | | ✅ | ✅ |
+| `current_company` | | ✅ | ✅ |
+| `connections` | | ✅ | ✅ |
+| `experience` | | ✅ | ✅ |
+| `outreach_priority` | | | ✅ |
+
+---
+
+### `linkedin-proxycurl` — vía API (sin browser)
+
+Acceso a datos de LinkedIn via [Proxycurl API](https://nubela.co/proxycurl).
+Sin browser, sin cookies, sin riesgo de bloqueo. Ideal para volumen alto o producción.
+Costo aproximado: **~$0.01 USD por crédito**.
+
+Requiere `PROXYCURL_API_KEY` en `.env`. Obtén tu key en [nubela.co/proxycurl](https://nubela.co/proxycurl).
+
+**5 modos disponibles:** `company-search` · `person-search` · `company` · `person` · `employees`
+
+```bash
+# ── Buscar empresas ───────────────────────────────────────────────────────────
+
+# Búsqueda simple
+python3 main.py linkedin-proxycurl company-search -q "digital health"
+python3 main.py linkedin-proxycurl company-search -q "telehealth" -n 20
+
+# Con filtro de ubicación
+python3 main.py linkedin-proxycurl company-search -q "health tech" --location "United States"
+python3 main.py linkedin-proxycurl company-search -q "salud digital" --location "Mexico"
+
+# Enriquecer con perfil completo
+python3 main.py linkedin-proxycurl company-search -q "digital health" -n 20 --enrich
+
+# Incluir datos de funding (rondas de inversión, inversores)
+python3 main.py linkedin-proxycurl company-search -q "healthtech" --enrich --funding
+
+# Exportar
+python3 main.py linkedin-proxycurl company-search -q "digital health" -n 30 --enrich --output csv
+
+
+# ── Perfil completo de una empresa por URL ────────────────────────────────────
+
+python3 main.py linkedin-proxycurl company \
+  -q "https://www.linkedin.com/company/nombre-empresa"
+
+# Con datos de funding
+python3 main.py linkedin-proxycurl company \
+  -q "https://www.linkedin.com/company/nombre-empresa" --funding
+
+
+# ── Buscar personas ───────────────────────────────────────────────────────────
+
+# Búsqueda simple
+python3 main.py linkedin-proxycurl person-search -q "digital health"
+
+# Con filtro de título
+python3 main.py linkedin-proxycurl person-search -q "health tech" -t "CTO"
+python3 main.py linkedin-proxycurl person-search -q "telemedicine" -t "Founder"
+python3 main.py linkedin-proxycurl person-search -q "health app" -t "Product Manager"
+
+# Con filtro de ubicación
+python3 main.py linkedin-proxycurl person-search -q "digital health" --location "Mexico"
+python3 main.py linkedin-proxycurl person-search -q "health tech" --location "United States"
+
+# Enriquecer con experiencia completa, skills, contacto
+python3 main.py linkedin-proxycurl person-search -q "digital health" -t "CTO" --enrich
+
+# Exportar
+python3 main.py linkedin-proxycurl person-search -q "health tech" -n 25 --enrich --output csv
+
+
+# ── Perfil completo de una persona por URL ────────────────────────────────────
+
+python3 main.py linkedin-proxycurl person \
+  -q "https://www.linkedin.com/in/username"
+
+
+# ── Empleados de una empresa ──────────────────────────────────────────────────
+
+# Todos los empleados (hasta N)
+python3 main.py linkedin-proxycurl employees \
+  -q "https://www.linkedin.com/company/nombre" -n 50
+
+# Filtrar por rol dentro de la empresa
+python3 main.py linkedin-proxycurl employees \
+  -q "https://www.linkedin.com/company/nombre" --title "engineer" -n 30
+python3 main.py linkedin-proxycurl employees \
+  -q "https://www.linkedin.com/company/nombre" --title "director" -n 20
+python3 main.py linkedin-proxycurl employees \
+  -q "https://www.linkedin.com/company/nombre" --title "product" -n 15
+```
+
+**Flags disponibles:**
+
+| Flag | Corto | Descripción | Default |
+|---|---|---|---|
+| `--query` | `-q` | Keyword de búsqueda o URL de LinkedIn | — |
+| `--title` | `-t` | Filtro de título (person-search y employees) | sin filtro |
+| `--location` | `-l` | Ubicación en texto libre (ej: `"United States"`) | sin filtro |
+| `--count` | `-n` | Número de resultados | `10` |
+| `--enrich` | `-e` | Enriquecer cada resultado con perfil completo | `false` |
+| `--funding` | | Incluir datos de funding (solo modo `company`) | `false` |
+| `--output` | `-o` | Formato: `json` \| `jsonl` \| `csv` \| `all` | `json` |
+
+**Campos en perfil de empresa enriquecido:**
+`name` · `description` · `website` · `industry` · `specialties` · `employee_count` · `headquarters` · `founded` · `company_type` · `follower_count` · `tagline` · `key_employees` · `funding` (con `--funding`)
+
+**Campos en perfil de persona enriquecido:**
+`name` · `headline` · `summary` · `location` · `country` · `current_title` · `current_company` · `connections` · `followers` · `email` · `phone` · `skills` · `experience` · `education`
+
+---
+
+### Flujos completos por caso de uso
+
+#### Market Research — mapear el ecosistema health tech
+
+```bash
+# Búsqueda amplia de empresas del sector
+python3 main.py linkedin-companies "digital health" --location usa --count 50 --output csv
+python3 main.py linkedin-companies "telehealth" --location latam --count 30 --output csv
+
+# Enriquecer con datos completos
+python3 main.py linkedin-companies "health tech" --enrich --output all
+
+# Con funding data via Proxycurl
+python3 main.py linkedin-proxycurl company-search -q "healthtech" -n 30 --enrich --funding --output csv
+```
+
+#### Lead Generation — encontrar decision-makers
+
+```bash
+# Buscar CTOs y Founders
+python3 main.py linkedin-people "digital health" \
+  --titles "CTO,Founder,CEO,CPO" --seniority "c_suite" \
+  --location usa --count 40 --output csv
+
+# Con Proxycurl (puede incluir email/teléfono)
+python3 main.py linkedin-proxycurl person-search \
+  -q "health tech" -t "CTO" -n 25 --enrich --output csv
+
+# Empleados senior de una empresa target específica
+python3 main.py linkedin-proxycurl employees \
+  -q "https://www.linkedin.com/company/empresa-target" \
+  --title "director" -n 20
+```
+
+#### Recruiting — pipeline de contratación
+
+```bash
+# Pipeline automático (busca + enriquece + ordena por seniority score)
+python3 main.py linkedin-people "digital health" \
+  --titles "CTO,VP Engineering,Director of Engineering" \
+  --recruiting --count 30 --output csv
+
+# Talento técnico en LATAM
+python3 main.py linkedin-people "health technology" \
+  --titles "Software Engineer,Backend Engineer,Data Engineer" \
+  --location latam --count 50
+
+# Perfil completo de un candidato específico
+python3 main.py linkedin-proxycurl person -q "https://www.linkedin.com/in/candidato"
+```
+
+---
+
+### Dónde se guardan los resultados
+
+Todos los outputs se guardan en `output/` con nombre automático:
+
+```
+output/
+├── linkedin_companies_digital_health_20260423_143000.json
+├── linkedin_people_health_tech_20260423_150000.csv
+└── proxycurl_companies_healthtech_20260423_160000.json
+```
+
+---
+
+### Estructura de archivos LinkedIn
+
+```
+scraper/
+├── linkedin_companies.py    ← Módulo A: búsqueda y perfiles de empresas
+├── linkedin_profiles.py     ← Módulo B: búsqueda y perfiles de personas
+└── linkedin_proxycurl.py    ← Módulo C: integración con Proxycurl API
+
+cookies/
+├── linkedin.json            ← Sesión guardada por linkedin-login (NO commitear)
+└── HOW_TO_GET_COOKIES.md    ← Instrucciones manuales de setup
+
+.env                         ← Credenciales (NO commitear)
+.env.example                 ← Plantilla de variables de entorno
+```
+
+---
+
+## 8. Referencia de selectores
+
+
 
 ### CSS Selectors
 
@@ -475,7 +954,7 @@ python3 main.py full "https://finance.yahoo.com/quote/CMCSA/analysis" \
 
 ---
 
-## 8. Formatos de exportación
+## 9. Formatos de exportación
 
 Todos los resultados se guardan en `output/` con nombre:
 `<dominio>_<fecha_hora>.json`
@@ -496,7 +975,7 @@ python3 main.py scrape https://sitio.com --output all
 
 ---
 
-## 9. Errores comunes y soluciones
+## 10. Errores comunes y soluciones
 
 ### `command not found: python`
 ```bash

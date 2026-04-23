@@ -21,3 +21,6 @@ yarn-debug.log*
 yarn-error.log*
 output/
 snapshots/
+.env
+cookies/linkedin.json
+cookies/*.json

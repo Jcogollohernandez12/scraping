@@ -16,11 +16,15 @@ from pathlib import Path
 
 import typer
 import yaml
+from dotenv import load_dotenv
 from rich.console import Console
 from rich.panel import Panel
 from rich.prompt import Confirm, Prompt
 from rich.syntax import Syntax
 from rich.table import Table
+
+# Load .env at startup so LINKEDIN_LI_AT, PROXYCURL_API_KEY, etc. are available
+load_dotenv(Path(__file__).parent / ".env")
 
 app = typer.Typer(help="Scrapling-powered scraper — tell it what URL and what to extract.")
 console = Console()
@@ -590,6 +594,442 @@ def deep(
 
     fetcher.close()
     console.rule("[bold green]All done![/bold green]")
+
+
+# ── LinkedIn: Login / session setup ──────────────────────────────────────────
+@app.command(name="linkedin-login")
+def linkedin_login(
+    email: str = typer.Option("", "--email", "-e", help="LinkedIn email (o dejar vacío para login manual)"),
+    password: str = typer.Option("", "--password", "-p", help="LinkedIn password"),
+    save: bool = typer.Option(True, "--save/--no-save", help="Guardar cookies en cookies/linkedin.json y .env"),
+):
+    """Iniciar sesión en LinkedIn y guardar la sesión para todos los comandos.
+
+    \b
+    Modos:
+      Auto   →  python3 main.py linkedin-login --email tu@email.com --password tupass
+      Manual →  python3 main.py linkedin-login        (abre browser, tú haces login)
+
+    Guarda las cookies en cookies/linkedin.json y actualiza .env con li_at.
+    Después de correr esto UNA VEZ no necesitas volver a hacerlo.
+    """
+    import os
+    import time
+    from playwright.sync_api import sync_playwright
+
+    _print_banner()
+    console.print("\n[bold cyan]LinkedIn Login Setup[/bold cyan]")
+
+    # Try loading from env first if no args given
+    if not email:
+        email = os.getenv("LINKEDIN_EMAIL", "").strip()
+    if not password:
+        password = os.getenv("LINKEDIN_PASSWORD", "").strip()
+
+    with sync_playwright() as p:
+        browser = p.chromium.launch(headless=False)
+        context = browser.new_context(
+            user_agent=(
+                "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) "
+                "AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36"
+            ),
+            viewport={"width": 1280, "height": 800},
+            locale="en-US",
+        )
+        page = context.new_page()
+
+        console.print("  [dim]Abriendo LinkedIn...[/dim]")
+
+        # Use networkidle so the page is fully rendered before interacting
+        try:
+            page.goto(
+                "https://www.linkedin.com/login",
+                wait_until="networkidle",
+                timeout=60000,
+            )
+        except Exception:
+            # networkidle can time out on slow connections — page is still usable
+            pass
+
+        # Dismiss cookie/GDPR banners if present
+        for banner_sel in [
+            "button[action-type='ACCEPT']",
+            "button#onetrust-accept-btn-handler",
+            "button[data-control-name='accept_cookies']",
+        ]:
+            try:
+                btn = page.query_selector(banner_sel)
+                if btn:
+                    btn.click()
+                    time.sleep(0.5)
+            except Exception:
+                pass
+
+        if email and password:
+            # ── Auto-login ────────────────────────────────────────────
+            console.print(f"  [dim]Ingresando credenciales para:[/dim] [cyan]{email}[/cyan]")
+
+            # Wait until the username field is visible and enabled
+            try:
+                page.wait_for_selector("#username", state="visible", timeout=30000)
+            except Exception:
+                # Fallback selectors LinkedIn has used historically
+                for sel in ["input[name='session_key']", "input[autocomplete='username']", "input[type='email']"]:
+                    el = page.query_selector(sel)
+                    if el:
+                        page.locator(sel).fill(email)
+                        break
+            else:
+                page.locator("#username").fill(email)
+
+            time.sleep(0.6)
+
+            # Password field
+            try:
+                page.wait_for_selector("#password", state="visible", timeout=10000)
+                page.locator("#password").fill(password)
+            except Exception:
+                for sel in ["input[name='session_password']", "input[type='password']"]:
+                    el = page.query_selector(sel)
+                    if el:
+                        page.locator(sel).fill(password)
+                        break
+
+            time.sleep(0.6)
+
+            # Submit
+            for submit_sel in ["button[type='submit']", "button[data-litms-control-urn*='login']", ".login__form_action_container button"]:
+                btn = page.query_selector(submit_sel)
+                if btn:
+                    btn.click()
+                    break
+
+            console.print("  [dim]Esperando respuesta de LinkedIn...[/dim]")
+
+            # Wait for redirect away from /login
+            try:
+                page.wait_for_url(lambda url: "/login" not in url, timeout=20000)
+            except Exception:
+                time.sleep(6)
+
+            # Handle security verification / captcha
+            current_url = page.url
+            if any(k in current_url for k in ["checkpoint", "challenge", "verification", "captcha"]):
+                console.print("\n[yellow]LinkedIn pidió verificación de seguridad.[/yellow]")
+                console.print("[bold]Completa la verificación en el browser y luego presiona Enter aquí.[/bold]")
+                input("  → Presiona Enter cuando hayas completado la verificación: ")
+                time.sleep(3)
+        else:
+            # ── Manual login ──────────────────────────────────────────
+            console.print("\n[bold yellow]Login manual:[/bold yellow]")
+            console.print("  1. Ingresa tu email y contraseña en el browser que se abrió")
+            console.print("  2. Completa cualquier verificación que aparezca")
+            console.print("  3. Espera hasta ver tu feed de LinkedIn")
+            console.print("  4. Vuelve aquí y presiona Enter\n")
+            input("  → Presiona Enter cuando estés logueado en LinkedIn: ")
+            time.sleep(2)
+
+        # Verify login succeeded
+        current_url = page.url
+        if "feed" not in current_url and "mynetwork" not in current_url and "linkedin.com/in/" not in current_url:
+            # Try navigating to feed to confirm
+            page.goto("https://www.linkedin.com/feed/", wait_until="domcontentloaded", timeout=15000)
+            time.sleep(3)
+            current_url = page.url
+
+        if "login" in current_url or "checkpoint" in current_url:
+            console.print("\n[red]Login no exitoso. Verifica tus credenciales.[/red]")
+            browser.close()
+            raise typer.Exit(1)
+
+        console.print("\n[bold green]✓ Login exitoso![/bold green]")
+
+        # Extract cookies
+        cookies = context.cookies()
+        browser.close()
+
+    # Find the important cookies
+    cookie_dict = {c["name"]: c["value"] for c in cookies}
+    li_at = cookie_dict.get("li_at", "")
+    jsessionid = cookie_dict.get("JSESSIONID", "")
+
+    if not li_at:
+        console.print("[red]No se encontró la cookie li_at. Intenta de nuevo.[/red]")
+        raise typer.Exit(1)
+
+    console.print(f"  [dim]li_at:[/dim] [green]{li_at[:30]}...[/green]")
+
+    if save:
+        # Save to cookies/linkedin.json
+        cookies_dir = Path("cookies")
+        cookies_dir.mkdir(exist_ok=True)
+        cookies_path = cookies_dir / "linkedin.json"
+        cookies_path.write_text(json.dumps(cookies, indent=2, ensure_ascii=False))
+        console.print(f"  [green]Cookies guardadas en:[/green] {cookies_path}")
+
+        # Update or create .env file
+        env_path = Path(".env")
+        env_lines: list[str] = []
+
+        if env_path.exists():
+            env_lines = env_path.read_text().splitlines()
+
+        # Update or add LINKEDIN_LI_AT
+        li_at_set = False
+        js_set = False
+        new_lines: list[str] = []
+        for line in env_lines:
+            if line.startswith("LINKEDIN_LI_AT="):
+                new_lines.append(f"LINKEDIN_LI_AT={li_at}")
+                li_at_set = True
+            elif line.startswith("LINKEDIN_JSESSIONID=") and jsessionid:
+                new_lines.append(f"LINKEDIN_JSESSIONID={jsessionid}")
+                js_set = True
+            else:
+                new_lines.append(line)
+
+        if not li_at_set:
+            new_lines.append(f"LINKEDIN_LI_AT={li_at}")
+        if not js_set and jsessionid:
+            new_lines.append(f"LINKEDIN_JSESSIONID={jsessionid}")
+
+        env_path.write_text("\n".join(new_lines) + "\n")
+        console.print(f"  [green]LINKEDIN_LI_AT guardado en:[/green] .env")
+
+        # Reload env so current process picks it up immediately
+        load_dotenv(env_path, override=True)
+
+    console.print("\n[bold green]Setup completo.[/bold green]")
+    console.print("[dim]Ahora puedes usar linkedin-companies, linkedin-people, etc. sin configuración adicional.[/dim]")
+
+
+# ── LinkedIn: Company search (Module A) ───────────────────────────────────────
+@app.command(name="linkedin-companies")
+def linkedin_companies(
+    keywords: str = typer.Argument("health tech", help="Search keywords e.g. 'digital health'"),
+    industries: str = typer.Option(
+        "", "--industries", "-i",
+        help="Comma-separated industry keys: hospital_healthcare,health_wellness_fitness,"
+             "biotechnology,pharmaceuticals,medical_devices,mental_health",
+    ),
+    location: str = typer.Option("", "--location", "-l", help="GEO key: usa,latam,mexico,colombia,brazil,uk,spain"),
+    count: int = typer.Option(25, "--count", "-n", help="Number of companies to find"),
+    enrich: bool = typer.Option(False, "--enrich", "-e", help="Fetch full profile for each company"),
+    headless: bool = typer.Option(False, "--headless/--no-headless", help="Run browser headless"),
+    output: str = typer.Option("json", "--output", "-o", help="json | jsonl | csv | all"),
+):
+    """[A] Search LinkedIn for health tech companies via Voyager API."""
+    _print_banner()
+    cfg = _load_config()
+
+    from scraper.linkedin_companies import search_companies, bulk_enrich_companies
+    from scraper.linkedin_proxycurl import print_companies_table
+    from scraper.exporter import Exporter
+
+    ind_list = [i.strip() for i in industries.split(",") if i.strip()] if industries else None
+
+    console.print(f"\n[bold]LinkedIn Company Search[/bold] — [cyan]{keywords}[/cyan]")
+    if ind_list:
+        console.print(f"  Industries: {ind_list}")
+    if location:
+        console.print(f"  Location: {location}")
+
+    companies = search_companies(
+        keywords=keywords,
+        industries=ind_list,
+        location=location,
+        count=count,
+        headless=headless,
+    )
+
+    if enrich and companies:
+        console.print(f"\n[bold]Enriching {len(companies)} company profiles...[/bold]")
+        companies = bulk_enrich_companies(companies, headless=headless)
+
+    print_companies_table(companies)
+
+    exporter = Exporter(cfg.get("defaults", {}).get("output_dir", "./output"))
+    exporter.save(companies, f"linkedin_companies_{keywords.replace(' ', '_')}", fmt=output)
+
+
+# ── LinkedIn: People search (Module B) ───────────────────────────────────────
+@app.command(name="linkedin-people")
+def linkedin_people(
+    keywords: str = typer.Argument("digital health", help="Search keywords"),
+    titles: str = typer.Option(
+        "CTO,Founder,CEO",
+        "--titles", "-t",
+        help="Comma-separated job titles to filter by",
+    ),
+    seniority: str = typer.Option(
+        "c_suite,vp,director",
+        "--seniority", "-s",
+        help="c_suite | vp | director | manager | senior | entry",
+    ),
+    location: str = typer.Option("", "--location", "-l", help="GEO key: usa,latam,mexico,colombia,uk"),
+    count: int = typer.Option(25, "--count", "-n", help="Number of profiles to find"),
+    enrich: bool = typer.Option(False, "--enrich", "-e", help="Fetch full profile for each person"),
+    recruiting: bool = typer.Option(False, "--recruiting", help="Run full recruiting pipeline (search+enrich+score)"),
+    headless: bool = typer.Option(False, "--headless/--no-headless", help="Run browser headless"),
+    output: str = typer.Option("json", "--output", "-o", help="json | jsonl | csv | all"),
+):
+    """[B] Search LinkedIn for health tech professionals (recruiting + market research)."""
+    _print_banner()
+    cfg = _load_config()
+
+    from scraper.exporter import Exporter
+    from scraper.linkedin_proxycurl import print_people_table
+
+    exporter = Exporter(cfg.get("defaults", {}).get("output_dir", "./output"))
+
+    titles_list = [t.strip() for t in titles.split(",") if t.strip()] if titles else None
+    seniority_list = [s.strip() for s in seniority.split(",") if s.strip()] if seniority else None
+
+    console.print(f"\n[bold]LinkedIn People Search[/bold] — [cyan]{keywords}[/cyan]")
+    if titles_list:
+        console.print(f"  Titles: {titles_list}")
+
+    if recruiting:
+        from scraper.linkedin_profiles import build_recruiting_list
+        profiles = build_recruiting_list(
+            keywords=keywords,
+            titles=titles_list,
+            location=location,
+            count=count,
+            enrich=enrich,
+            headless=headless,
+        )
+    else:
+        from scraper.linkedin_profiles import search_people, get_person_profile
+        from scraper.linkedin_companies import load_linkedin_cookies
+
+        cookies = load_linkedin_cookies()
+        profiles = search_people(
+            keywords=keywords,
+            titles=titles_list,
+            seniority=seniority_list,
+            location=location,
+            count=count,
+            headless=headless,
+            cookies=cookies,
+        )
+
+        if enrich and profiles:
+            console.print(f"\n[bold]Enriching {len(profiles)} profiles...[/bold]")
+            enriched = []
+            import time, random
+            for i, p in enumerate(profiles):
+                url = p.get("linkedin_url", "")
+                if not url:
+                    enriched.append(p)
+                    continue
+                console.print(f"  [{i+1}/{len(profiles)}] [cyan]{p.get('name', url)}[/cyan]")
+                try:
+                    full = get_person_profile(url, cookies=cookies, headless=headless)
+                    enriched.append({**p, **full})
+                except Exception as e:
+                    console.print(f"    [red]{e}[/red]")
+                    enriched.append(p)
+                time.sleep(cfg.get("linkedin", {}).get("rate_limit_delay", 3.5) + random.uniform(0, 1))
+            profiles = enriched
+
+    print_people_table(profiles)
+    exporter.save(profiles, f"linkedin_people_{keywords.replace(' ', '_')}", fmt=output)
+
+
+# ── LinkedIn: Proxycurl API (Module C) ────────────────────────────────────────
+@app.command(name="linkedin-proxycurl")
+def linkedin_proxycurl(
+    mode: str = typer.Argument(
+        ...,
+        help="Mode: company-search | person-search | company | person | employees",
+    ),
+    query: str = typer.Option("", "--query", "-q", help="Search keyword or LinkedIn URL"),
+    title: str = typer.Option("", "--title", "-t", help="Job title filter (person-search)"),
+    location: str = typer.Option("", "--location", "-l", help="Location filter"),
+    count: int = typer.Option(10, "--count", "-n", help="Number of results"),
+    enrich: bool = typer.Option(False, "--enrich", "-e", help="Enrich each result with full profile"),
+    funding: bool = typer.Option(False, "--funding", help="Include funding data (company mode)"),
+    output: str = typer.Option("json", "--output", "-o", help="json | jsonl | csv | all"),
+):
+    """[C] LinkedIn data via Proxycurl API (requires PROXYCURL_API_KEY).
+
+    \b
+    Modes:
+      company-search  Search companies by keyword
+      person-search   Search people by keyword/title
+      company         Get full company profile from URL
+      person          Get full person profile from URL
+      employees       List employees of a company (URL)
+
+    \b
+    Examples:
+      python main.py linkedin-proxycurl company-search -q "digital health" -n 20 --enrich
+      python main.py linkedin-proxycurl person-search -q "telemedicine" -t "CTO" --enrich
+      python main.py linkedin-proxycurl company -q "https://linkedin.com/company/stripe" --funding
+      python main.py linkedin-proxycurl employees -q "https://linkedin.com/company/apple" -n 50
+    """
+    _print_banner()
+    cfg = _load_config()
+
+    from scraper import linkedin_proxycurl as pc
+    from scraper.linkedin_proxycurl import print_companies_table, print_people_table
+    from scraper.exporter import Exporter
+
+    exporter = Exporter(cfg.get("defaults", {}).get("output_dir", "./output"))
+    extra = ["funding"] if funding else None
+    slug = query.replace(" ", "_").replace("/", "_")[:40]
+
+    console.print(f"\n[bold]Proxycurl[/bold] — mode=[cyan]{mode}[/cyan]  query={query}")
+
+    if mode == "company-search":
+        results = pc.search_companies(keyword=query or "health tech", location=location, count=count)
+        if enrich and results:
+            results = pc.bulk_enrich_companies(results, extra_fields=extra)
+        print_companies_table(results)
+        exporter.save(results, f"proxycurl_companies_{slug}", fmt=output)
+
+    elif mode == "person-search":
+        results = pc.search_people(keyword=query or "health tech", title=title, location=location, count=count)
+        if enrich and results:
+            results = pc.bulk_enrich_people(results)
+        print_people_table(results)
+        exporter.save(results, f"proxycurl_people_{slug}", fmt=output)
+
+    elif mode == "company":
+        if not query:
+            console.print("[red]Provide --query with the LinkedIn company URL[/red]")
+            raise typer.Exit(1)
+        result = pc.get_company(query, extra_fields=extra)
+        if result:
+            _display_result(result)
+            exporter.save(result, f"proxycurl_company_{slug}", fmt=output)
+        else:
+            console.print("[yellow]No data returned.[/yellow]")
+
+    elif mode == "person":
+        if not query:
+            console.print("[red]Provide --query with the LinkedIn profile URL[/red]")
+            raise typer.Exit(1)
+        result = pc.get_person(query)
+        if result:
+            _display_result(result)
+            exporter.save(result, f"proxycurl_person_{slug}", fmt=output)
+        else:
+            console.print("[yellow]No data returned.[/yellow]")
+
+    elif mode == "employees":
+        if not query:
+            console.print("[red]Provide --query with the LinkedIn company URL[/red]")
+            raise typer.Exit(1)
+        results = pc.company_employees(query, count=count, role_keyword=title)
+        print_people_table(results)
+        exporter.save(results, f"proxycurl_employees_{slug}", fmt=output)
+
+    else:
+        console.print(f"[red]Unknown mode:[/red] {mode}")
+        console.print("[dim]Valid modes: company-search | person-search | company | person | employees[/dim]")
+        raise typer.Exit(1)
 
 
 # ──────────────────────────────────────────────────────────────────────────────

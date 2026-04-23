@@ -51,3 +51,30 @@ proxies: []
   # - http://proxy1:8080
   # - http://proxy2:8080
 proxy_strategy: cyclic  # cyclic | random
+
+# LinkedIn scraper settings
+linkedin:
+  headless: false          # false = visible browser (better for first run / login)
+  wait_seconds: 8          # time to wait for Voyager API responses
+  rate_limit_delay: 3.5    # seconds between profile requests
+  max_pages: 5             # max pagination pages per search
+  cookies_file: ./cookies/linkedin.json
+  # Keywords presets for health tech
+  company_keywords:
+    - "health tech"
+    - "digital health"
+    - "telehealth"
+    - "healthtech startup"
+    - "health informatics"
+    - "medtech"
+    - "mental health tech"
+  people_keywords:
+    - "digital health"
+    - "health technology"
+    - "telemedicine"
+
+# Proxycurl API settings (https://nubela.co/proxycurl)
+proxycurl:
+  base_url: https://nubela.co/proxycurl/api
+  rate_limit_delay: 1.5    # seconds between API calls
+  cache_strategy: if-present  # if-present | if-recent | never
