@@ -1,0 +1,53 @@
+# Scrapling Project Configuration
+defaults:
+  # Fetcher strategy: auto | http | stealth | dynamic
+  strategy: auto
+  headless: true
+  timeout: 30
+  output_dir: ./output
+  export_format: json  # json | jsonl | csv | all
+
+# Auto-detection thresholds
+auto_detection:
+  # Sites that likely need stealth mode (keywords in URL)
+  stealth_keywords:
+    - cloudflare
+    - distil
+    - akamai
+  # Sites that likely need dynamic rendering (keywords in URL)
+  dynamic_keywords:
+    - spa
+    - react
+    - angular
+    - vue
+
+# HTTP Fetcher settings
+http:
+  impersonate: chrome
+  stealthy_headers: true
+  http3: false
+
+# Stealth Fetcher settings
+stealth:
+  solve_cloudflare: true
+  google_search: false
+  disable_resources: true
+
+# Dynamic Fetcher settings
+dynamic:
+  network_idle: true
+  disable_resources: false
+  load_dom: true
+
+# Spider settings
+spider:
+  concurrent_requests: 10
+  download_delay: 0.5
+  robots_txt_obey: false
+  crawldir: ./crawl_data
+
+# Proxy settings (optional)
+proxies: []
+  # - http://proxy1:8080
+  # - http://proxy2:8080
+proxy_strategy: cyclic  # cyclic | random

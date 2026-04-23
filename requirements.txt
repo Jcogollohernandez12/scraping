@@ -1,0 +1,5 @@
+scrapling[all]
+rich
+typer
+pyyaml
+python-dotenv
