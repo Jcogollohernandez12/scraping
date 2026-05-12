@@ -1,8 +1,7 @@
 """
 A) LinkedIn Company Extractor — Health Tech
-Dual strategy:
-  1. Voyager API interception (requires li_at cookie)
-  2. HTML fallback for public company pages
+Strategy: Playwright browser + DOM extraction from rendered page.
+LinkedIn renders results client-side; we let the page fully render then extract.
 """
 from __future__ import annotations
 
@@ -12,15 +11,11 @@ import re
 import time
 import random
 from pathlib import Path
-from typing import Optional
 
 from rich.console import Console
 
 console = Console()
 
-VOYAGER = "https://www.linkedin.com/voyager/api"
-
-# LinkedIn industry codes relevant to health tech
 HEALTH_INDUSTRIES = {
     "hospital_healthcare": "14",
     "health_wellness_fitness": "96",
@@ -32,7 +27,6 @@ HEALTH_INDUSTRIES = {
     "research": "87",
 }
 
-# Common geo URNs for location filtering
 GEO_URNS = {
     "usa": "urn:li:geo:103644278",
     "latam": "urn:li:geo:91000001",
@@ -47,19 +41,15 @@ GEO_URNS = {
 # ── Cookie management ─────────────────────────────────────────────────────────
 
 def load_linkedin_cookies() -> dict[str, str]:
-    """Load LinkedIn session cookies from env vars or cookies/linkedin.json."""
+    """
+    Load LinkedIn session cookies.
+    Merges file (all 48+ cookies) + env vars, env vars take priority.
+    """
     cookies: dict[str, str] = {}
 
-    li_at = os.getenv("LINKEDIN_LI_AT", "").strip()
-    jsessionid = os.getenv("LINKEDIN_JSESSIONID", "").strip()
-
-    if li_at:
-        cookies["li_at"] = li_at
-    if jsessionid:
-        cookies["JSESSIONID"] = f'"{jsessionid}"' if not jsessionid.startswith('"') else jsessionid
-
+    # Load ALL cookies from file for a complete session
     cookies_file = Path("cookies/linkedin.json")
-    if cookies_file.exists() and not li_at:
+    if cookies_file.exists():
         try:
             raw = json.loads(cookies_file.read_text())
             if isinstance(raw, list):
@@ -70,6 +60,14 @@ def load_linkedin_cookies() -> dict[str, str]:
                 cookies.update(raw)
         except Exception as e:
             console.print(f"  [yellow]Cookie file error:[/yellow] {e}")
+
+    # Env vars override file
+    li_at = os.getenv("LINKEDIN_LI_AT", "").strip()
+    jsessionid = os.getenv("LINKEDIN_JSESSIONID", "").strip()
+    if li_at:
+        cookies["li_at"] = li_at
+    if jsessionid:
+        cookies["JSESSIONID"] = f'"{jsessionid}"' if not jsessionid.startswith('"') else jsessionid
 
     return cookies
 
@@ -82,132 +80,132 @@ def _cookies_to_playwright(cookies: dict[str, str]) -> list[dict]:
     ]
 
 
-# ── Voyager response parsers ──────────────────────────────────────────────────
+# ── DOM extraction from rendered page ────────────────────────────────────────
 
-def _parse_voyager_search(json_data: dict) -> list[dict]:
-    """Parse Voyager blended search response into company records."""
-    companies: list[dict] = []
+def _extract_companies_from_page(page) -> list[dict]:
+    """
+    Extract company cards from a rendered LinkedIn search results page.
+    Uses baseCompanyUrl() to normalize all link variants to the same slug URL.
+    """
+    results = page.evaluate("""
+    () => {
+        // Strip sub-paths and query params → linkedin.com/company/slug only
+        const baseUrl = (href) => {
+            if (!href) return '';
+            const m = href.match(
+                /(https?:\\/\\/(?:www\\.)?linkedin\\.com\\/company\\/[A-Za-z0-9_%-]+)/i
+            );
+            return m ? m[1] : '';
+        };
+        const getAriaText = (el) => {
+            if (!el) return '';
+            const h = el.querySelector('span[aria-hidden="true"]') ||
+                       el.querySelector('span[aria-hidden]');
+            return (h ? h.innerText : el.innerText || '').trim();
+        };
+        const SKIP = new Set(['Seguir','Follow','Conectar','Connect',
+                               'Pending','Pendiente','·','•','Ver más','See more',
+                               'Reactivar','Premium','Mensaje','Message']);
 
-    top_level = (
-        json_data.get("data", {}).get("elements", [])
-        or json_data.get("elements", [])
-    )
+        // ── Strategy 1: known card-container class selectors ──────────────
+        const cardSelectors = [
+            'li.reusable-search__result-container',
+            'li[class*="result-container"]',
+            '.entity-result',
+            '[data-view-name="search-entity-result-universal-template"]',
+            'div[data-chameleon-result-urn]',
+        ];
+        for (const sel of cardSelectors) {
+            const cards = Array.from(document.querySelectorAll(sel));
+            if (cards.length === 0) continue;
+            const out = [];
+            cards.forEach(card => {
+                const linkEl = card.querySelector('a[href*="/company/"]');
+                if (!linkEl) return;
+                const href = baseUrl(linkEl.href);
+                if (!href) return;
+                const name = getAriaText(linkEl) || getAriaText(card.querySelector('h3,h4'));
+                if (!name || name.length < 2) return;
+                const sub1 = card.querySelector(
+                    '.entity-result__primary-subtitle,[class*="primary-subtitle"]');
+                const sub2 = card.querySelector(
+                    '.entity-result__secondary-subtitle,[class*="secondary-subtitle"]');
+                out.push({ name, linkedin_url: href,
+                           industry_size: sub1 ? sub1.innerText.trim() : '',
+                           location: sub2 ? sub2.innerText.trim() : '',
+                           company_id: '', source: 'card' });
+            });
+            if (out.length > 0) return out;
+        }
 
-    for group in top_level:
-        hits = group.get("elements", [group]) if isinstance(group, dict) else []
-        for hit in hits:
-            entity = (
-                hit.get("entityResult")
-                or hit.get("company")
-                or hit.get("entityLockupView")
-                or hit
-            )
-            if not entity or not isinstance(entity, dict):
-                continue
+        // ── Strategy 2: scan main content for ALL /company/ links ─────────
+        // baseUrl() normalizes /company/slug/life/?trk=... → /company/slug
+        // so all link variants for the same company collapse to one entry.
+        const root = document.querySelector('.scaffold-layout__main') ||
+                     document.querySelector('main') || document.body;
 
-            name = (
-                (entity.get("title") or {}).get("text", "")
-                or entity.get("name", "")
-                or (entity.get("primaryText") or {}).get("text", "")
-            )
-            if not name:
-                continue
+        const seen = new Set();
+        const out = [];
 
-            nav_url = entity.get("navigationUrl", "") or entity.get("url", "")
-            if nav_url and not nav_url.startswith("http"):
-                nav_url = f"https://www.linkedin.com{nav_url}"
+        root.querySelectorAll('a[href*="/company/"]').forEach(link => {
+            if (link.closest('nav,header,footer')) return;
+            const href = baseUrl(link.href);
+            if (!href || seen.has(href)) return;
+            seen.add(href);
 
-            industry_size = (
-                (entity.get("primarySubtitle") or {}).get("text", "")
-                or (entity.get("subtitle") or {}).get("text", "")
-            )
-            location = (entity.get("secondarySubtitle") or {}).get("text", "")
+            const name = getAriaText(link);
+            if (!name || name.length < 2 || name.length > 120) return;
 
-            tracking = hit.get("trackingUrn", "") or entity.get("trackingUrn", "")
-            company_id = ""
-            if tracking:
-                m = re.search(r":company:(\d+)", tracking)
-                if m:
-                    company_id = m.group(1)
+            // Accept li OR any classed div as the card container
+            const container = link.closest('li') ||
+                              link.closest('div[class]') ||
+                              link.parentElement;
+            let industry_size = '', location = '';
+            if (container) {
+                const leaves = [];
+                container.querySelectorAll('span,div,p').forEach(el => {
+                    // Only process leaf-ish elements (no block sub-elements)
+                    const hasBlock = Array.from(el.children).some(
+                        c => !['SPAN','A','B','EM','STRONG','I'].includes(c.tagName));
+                    if (hasBlock) return;
+                    const t = el.innerText.trim();
+                    if (t && t !== name && t.length > 2 && t.length < 100 &&
+                        !SKIP.has(t) && !t.includes('\\n')) leaves.push(t);
+                });
+                const uniq = [...new Set(leaves)];
+                industry_size = uniq[0] || '';
+                location = uniq[1] || '';
+            }
+            out.push({ name, linkedin_url: href, industry_size, location,
+                       company_id: '', source: 'link_scan' });
+        });
 
-            companies.append({
-                "company_id": company_id,
-                "name": name.strip(),
-                "linkedin_url": nav_url,
-                "industry_size": industry_size,
-                "location": location,
-                "source": "voyager_api",
-            })
+        return out;
+    }
+    """)
 
-    return companies
-
-
-def _parse_company_voyager_profile(data: dict) -> dict:
-    """Parse a Voyager /organization/companies/{id} response."""
-    out: dict = {}
-
-    out["name"] = data.get("name") or data.get("localizedName", "")
-    out["description"] = data.get("description") or data.get("localizedDescription", "")
-    out["website"] = data.get("companyPageUrl") or data.get("websiteUrl", "")
-    out["employee_count"] = data.get("staffCount") or data.get("employeeCount", "")
-    out["founded"] = (data.get("foundedOn") or {}).get("year", "")
-    out["company_type"] = data.get("companyType", {}).get("localizedName", "")
-    out["specialties"] = data.get("specialities", [])
-
-    hq = data.get("headquarter") or {}
-    city = hq.get("city", "")
-    country = hq.get("country", "")
-    out["headquarters"] = ", ".join(filter(None, [city, country]))
-
-    follower_data = data.get("followingInfo") or {}
-    out["followers"] = follower_data.get("followerCount", "")
-
-    industries = data.get("industries", [])
-    out["industries"] = [ind.get("localizedName", "") for ind in industries if isinstance(ind, dict)]
-
-    return {k: v for k, v in out.items() if v or v == 0}
+    return results or []
 
 
-def _parse_company_html(html_page) -> dict:
-    """HTML fallback parser for public LinkedIn company pages."""
-    out: dict = {}
-
-    full_text = " ".join(html_page.css("body *::text").get_all())
-
-    name_el = html_page.css("h1").first
-    if name_el:
-        out["name"] = " ".join(name_el.css("::text").get_all()).strip()
-
-    about_selectors = [
-        ".org-about-us-organization-description__text",
-        "[data-test-id='about-us__description']",
-        ".org-about-module__description",
-        "section.about p",
-    ]
-    for sel in about_selectors:
-        els = html_page.css(sel)
-        if els:
-            out["description"] = " ".join(els.css("::text").get_all()).strip()
-            break
-
-    follower_m = re.search(r"([\d,]+)\s*follower", full_text, re.I)
-    if follower_m:
-        out["followers"] = int(follower_m.group(1).replace(",", ""))
-
-    size_m = re.search(
-        r"(\d[\d,]*\s*[-–]\s*\d[\d,]*|\d[\d,]+\+?)\s*employees?", full_text, re.I
-    )
-    if size_m:
-        out["employee_count"] = size_m.group(0).strip()
-
-    website_els = html_page.css(
-        "a[data-control-name='visit_company_website'], "
-        ".org-about-us-organization-description a[href*='http']"
-    )
-    if website_els:
-        out["website"] = website_els.first.attrib.get("href", "")
-
-    return {k: v for k, v in out.items() if v}
+def _extract_total_results(page) -> int:
+    """Get the total number of results shown by LinkedIn."""
+    try:
+        text = page.evaluate("""
+        () => {
+            const el = document.querySelector(
+                '.search-results-container h2, ' +
+                '.pb2.t-black--light.t-14, ' +
+                'div[class*="results"] h2'
+            );
+            return el ? el.innerText : '';
+        }
+        """)
+        m = re.search(r"([\d,\.]+)", text or "")
+        if m:
+            return int(m.group(1).replace(",", "").replace(".", ""))
+    except Exception:
+        pass
+    return 0
 
 
 # ── Public API ────────────────────────────────────────────────────────────────
@@ -219,22 +217,22 @@ def search_companies(
     count: int = 25,
     headless: bool = False,
     cookies: dict | None = None,
-    wait_seconds: int = 8,
+    wait_seconds: int = 10,
 ) -> list[dict]:
     """
-    Search LinkedIn for health tech companies via Voyager API interception.
+    Search LinkedIn for health tech companies.
+    Uses a real browser to let the page render, then extracts from the DOM.
 
     Args:
-        keywords:   Search terms e.g. "digital health", "telehealth", "healthtech"
-        industries: Keys from HEALTH_INDUSTRIES (None = all health industries)
-        location:   Key from GEO_URNS or raw URN string
-        count:      Target number of results (LinkedIn paginates at 10)
-        headless:   False = visible browser (recommended for first run / login)
-        cookies:    LinkedIn session cookies (None = auto-load from env/file)
-        wait_seconds: Wait time for Voyager API responses
+        keywords:     Search terms e.g. "digital health", "telehealth"
+        industries:   Keys from HEALTH_INDUSTRIES (None = no industry filter)
+        location:     Key from GEO_URNS or raw URN string
+        count:        Number of results to return
+        headless:     True = hidden browser, False = visible (default)
+        wait_seconds: Seconds to wait for page to render results (default 10)
 
     Returns:
-        List of company dicts with: company_id, name, linkedin_url,
+        List of company dicts: company_id, name, linkedin_url,
         industry_size, location, source
     """
     from playwright.sync_api import sync_playwright
@@ -242,27 +240,29 @@ def search_companies(
     if cookies is None:
         cookies = load_linkedin_cookies()
 
-    if not cookies.get("li_at"):
-        console.print("[yellow]No li_at cookie found.[/yellow]")
-        console.print("[dim]Set LINKEDIN_LI_AT env var or add cookies/linkedin.json[/dim]")
-        console.print("[dim]Running with --no-headless allows manual login.[/dim]")
+    has_li_at = bool(cookies.get("li_at"))
+    console.print(f"  [dim]Cookies:[/dim] {len(cookies)} | li_at: {'✅' if has_li_at else '❌'}")
 
-    geo_urn = GEO_URNS.get(location, location) if location else ""
-    ind_filter = ""
-    if industries:
-        codes = [HEALTH_INDUSTRIES.get(i, i) for i in industries]
-        ind_filter = "&".join(f"facetIndustry={c}" for c in codes)
-    else:
-        all_codes = list(HEALTH_INDUSTRIES.values())
-        ind_filter = "&".join(f"facetIndustry={c}" for c in all_codes)
+    if not has_li_at:
+        console.print("[red]No hay cookie li_at.[/red]")
+        console.print("[dim]Corre: python3 main.py linkedin-login --email EMAIL --password PASS[/dim]")
+        return []
 
-    encoded_kw = keywords.replace(" ", "%20")
+    # Build search URL (keywords only — simple and reliable)
+    import urllib.parse
     base_search = (
         f"https://www.linkedin.com/search/results/companies/"
-        f"?keywords={encoded_kw}&{ind_filter}"
+        f"?keywords={urllib.parse.quote(keywords)}&origin=GLOBAL_SEARCH_HEADER"
     )
-    if geo_urn:
-        base_search += f"&geoUrn={geo_urn.replace(':', '%3A')}"
+
+    # Industry filter: LinkedIn URL format is facetIndustry=["14","96"]
+    if industries:
+        codes = [HEALTH_INDUSTRIES.get(i, i) for i in industries]
+        base_search += f"&facetIndustry={urllib.parse.quote(json.dumps(codes))}"
+
+    if location:
+        geo = GEO_URNS.get(location, location)
+        base_search += f"&geoUrn={urllib.parse.quote(geo)}"
 
     captured: list[dict] = []
 
@@ -276,59 +276,149 @@ def search_companies(
             viewport={"width": 1280, "height": 800},
             locale="en-US",
         )
-
-        if cookies:
-            context.add_cookies(_cookies_to_playwright(cookies))
-
+        context.add_cookies(_cookies_to_playwright(cookies))
         page = context.new_page()
 
-        def on_response(response):
-            url = response.url
-            if "voyager/api/search/blended" in url or "voyager/api/search/cluster" in url:
-                try:
-                    body = response.body()
-                    data = json.loads(body)
-                    hits = _parse_voyager_search(data)
-                    captured.extend(hits)
-                    console.print(f"  [green]Voyager:[/green] +{len(hits)} companies (total {len(captured)})")
-                except Exception:
-                    pass
+        console.print(f"  [dim]Abriendo:[/dim] {base_search[:90]}...")
+        try:
+            page.goto(base_search, wait_until="domcontentloaded", timeout=60000)
+        except Exception:
+            pass
 
-        page.on("response", on_response)
+        # Check for login wall
+        current_url = page.url
+        if "login" in current_url or "authwall" in current_url:
+            console.print("[red]LinkedIn redirigió al login — sesión expirada.[/red]")
+            console.print("[dim]Corre: python3 main.py linkedin-login --email EMAIL --password PASS[/dim]")
+            browser.close()
+            return []
 
-        console.print(f"  [dim]Searching:[/dim] {base_search[:80]}...")
-        page.goto(base_search, wait_until="domcontentloaded", timeout=60000)
-        page.wait_for_timeout(3000)
-        time.sleep(wait_seconds)
+        # Wait for results to appear — try smart wait first, fall back to fixed sleep
+        console.print("  [dim]Esperando resultados...[/dim]")
+        result_selectors = [
+            "li.reusable-search__result-container",
+            "li[class*='result-container']",
+            ".entity-result",
+            "div[data-chameleon-result-urn]",
+            ".search-results-container li",
+        ]
+        smart_wait_ok = False
+        for sel in result_selectors:
+            try:
+                page.wait_for_selector(sel, timeout=15000)
+                console.print(f"  [dim]Resultados detectados con: {sel}[/dim]")
+                smart_wait_ok = True
+                break
+            except Exception:
+                continue
 
-        # Scroll to load more results
-        pages_loaded = 1
-        while len(captured) < count and pages_loaded < 5:
-            for _ in range(4):
+        if not smart_wait_ok:
+            # Results not detected via selector — scroll to trigger lazy-load and wait
+            console.print(f"  [dim]No detectados via selector. Scroll + espera {wait_seconds}s...[/dim]")
+            for _ in range(3):
+                page.evaluate("window.scrollBy(0, 600)")
+                time.sleep(1.5)
+            time.sleep(max(wait_seconds - 4, 3))
+        else:
+            # Give JS a moment to fully populate all cards
+            time.sleep(2)
+
+        # Show how many results LinkedIn found
+        total = _extract_total_results(page)
+        if total:
+            console.print(f"  [dim]LinkedIn reporta ~{total:,} resultados totales[/dim]")
+
+        # Extract first page
+        batch = _extract_companies_from_page(page)
+        if batch:
+            captured.extend(batch)
+            console.print(f"  [green]Página 1:[/green] +{len(batch)} empresas")
+        else:
+            # Scroll + retry once
+            console.print("  [yellow]Sin resultados en página 1. Scrolleando...[/yellow]")
+            for _ in range(6):
                 page.evaluate("window.scrollBy(0, window.innerHeight)")
-                time.sleep(random.uniform(1.0, 2.0))
-
-            # Click "Next" pagination if present
-            next_btn = page.query_selector("button[aria-label='Next']")
-            if next_btn:
-                next_btn.click()
-                time.sleep(random.uniform(2.5, 4.0))
-                pages_loaded += 1
+                time.sleep(1.5)
+            batch = _extract_companies_from_page(page)
+            if batch:
+                captured.extend(batch)
+                console.print(f"  [green]Tras scroll:[/green] +{len(batch)} empresas")
             else:
+                # Diagnostic: show what links actually exist in the DOM
+                diag = page.evaluate("""
+                () => {
+                    const allA = Array.from(document.querySelectorAll('a[href]'));
+                    const companyLinks = allA.filter(a => a.href.includes('/company/'));
+                    const searchLinks = allA.filter(a => a.href.includes('/search/'));
+                    const sampleHrefs = allA.slice(0, 30).map(a => a.href.substring(0, 80));
+                    const companyHrefs = companyLinks.slice(0, 15).map(a =>
+                        ({href: a.href.substring(0, 80), text: (a.innerText||'').substring(0,40)}));
+                    return {
+                        total_links: allA.length,
+                        company_links: companyLinks.length,
+                        search_links: searchLinks.length,
+                        company_hrefs: companyHrefs,
+                        sample_hrefs: sampleHrefs,
+                    };
+                }
+                """)
+                console.print(f"  [yellow]DIAGNÓSTICO DOM:[/yellow]")
+                console.print(f"  Total <a> tags: {diag['total_links']}")
+                console.print(f"  Links /company/: {diag['company_links']}")
+                console.print(f"  Links /search/ : {diag['search_links']}")
+                console.print(f"  Links empresa encontrados:")
+                for item in diag['company_hrefs']:
+                    console.print(f"    {item['href']}  →  '{item['text']}'")
+                if not diag['company_hrefs']:
+                    console.print("  [red]NINGÚN link /company/ en el DOM[/red]")
+                    console.print("  Primeros 10 links de la página:")
+                    for h in diag['sample_hrefs'][:10]:
+                        console.print(f"    {h}")
+
+        # Paginate for more results
+        page_num = 1
+        while len(captured) < count and page_num < 10:
+            # Try clicking "Next" button
+            try:
+                next_btn = page.query_selector("button[aria-label='Next']")
+                if not next_btn:
+                    # Try via URL pagination
+                    next_url = base_search + f"&page={page_num + 1}"
+                    page.goto(next_url, wait_until="domcontentloaded", timeout=30000)
+                    time.sleep(wait_seconds)
+                else:
+                    next_btn.click()
+                    time.sleep(random.uniform(3, 5))
+
+                batch = _extract_companies_from_page(page)
+                if not batch:
+                    break
+                captured.extend(batch)
+                console.print(f"  [green]Página {page_num + 1}:[/green] +{len(batch)} empresas (total {len(captured)})")
+                page_num += 1
+            except Exception as e:
+                console.print(f"  [dim]Paginación detenida: {e}[/dim]")
                 break
 
         browser.close()
 
-    # Deduplicate
+    # Deduplicate by URL
     seen: set[str] = set()
     unique: list[dict] = []
     for c in captured:
-        key = c.get("company_id") or c["name"].lower().strip()
-        if key not in seen:
+        key = c.get("linkedin_url") or c.get("name", "").lower().strip()
+        if key and key not in seen:
             seen.add(key)
             unique.append(c)
 
-    console.print(f"  [bold green]Companies found:[/bold green] {len(unique)}")
+    if not unique:
+        console.print("[red]No se encontraron empresas.[/red]")
+        console.print("[dim]Causas posibles:[/dim]")
+        console.print("[dim]  1. Sesión expirada → corre linkedin-login de nuevo[/dim]")
+        console.print("[dim]  2. LinkedIn mostró captcha → aumenta --wait o corre visible[/dim]")
+        console.print("[dim]  3. Rate limit → espera unos minutos y reintenta[/dim]")
+
+    console.print(f"  [bold green]Total empresas:[/bold green] {len(unique)}")
     return unique[:count]
 
 
@@ -339,17 +429,15 @@ def get_company_profile(
     wait_seconds: int = 6,
 ) -> dict:
     """
-    Fetch full company profile from a LinkedIn company URL.
-    Combines Voyager API data with HTML fallback.
+    Fetch full company profile from a LinkedIn company /about page.
 
     Args:
-        linkedin_url: Full LinkedIn company URL or just the slug (e.g. "stripe")
+        linkedin_url: Full LinkedIn company URL or slug
         cookies:      LinkedIn session cookies
-        headless:     Run browser headless
 
     Returns:
-        Company dict with: name, description, website, employee_count,
-        headquarters, founded, specialties, industries, followers
+        Company dict with name, description, website, employee_count,
+        headquarters, founded, specialties, followers
     """
     from playwright.sync_api import sync_playwright
 
@@ -359,9 +447,8 @@ def get_company_profile(
     if not linkedin_url.startswith("http"):
         linkedin_url = f"https://www.linkedin.com/company/{linkedin_url}"
 
-    company: dict = {"linkedin_url": linkedin_url, "source": "company_profile"}
-    voyager_profile: dict = {}
-    page_html: str = ""
+    about_url = linkedin_url.rstrip("/") + "/about/"
+    profile: dict = {"linkedin_url": linkedin_url}
 
     with sync_playwright() as p:
         browser = p.chromium.launch(headless=headless)
@@ -372,53 +459,85 @@ def get_company_profile(
             ),
             locale="en-US",
         )
-
-        if cookies:
-            context.add_cookies(_cookies_to_playwright(cookies))
-
+        context.add_cookies(_cookies_to_playwright(cookies))
         page = context.new_page()
 
-        def on_response(response):
-            url = response.url
-            if (
-                "voyager/api/organization/companies" in url
-                or "voyager/api/entities?ids=List" in url
-                or "voyager/api/organization/companiesV2" in url
-            ):
-                try:
-                    data = json.loads(response.body())
-                    voyager_profile.update(data)
-                except Exception:
-                    pass
+        try:
+            page.goto(about_url, wait_until="domcontentloaded", timeout=30000)
+        except Exception:
+            pass
 
-        page.on("response", on_response)
-        page.goto(linkedin_url, wait_until="domcontentloaded", timeout=60000)
-        page.wait_for_timeout(3000)
         time.sleep(wait_seconds)
 
-        # Navigate to /about for extra company details
-        about_url = linkedin_url.rstrip("/") + "/about/"
-        page.goto(about_url, wait_until="domcontentloaded", timeout=30000)
-        time.sleep(3)
+        data = page.evaluate("""
+        () => {
+            const getText = (sel) => {
+                const el = document.querySelector(sel);
+                return el ? el.innerText.trim() : '';
+            };
+            const getAllText = (sel) => {
+                return Array.from(document.querySelectorAll(sel))
+                    .map(e => e.innerText.trim()).filter(Boolean);
+            };
 
-        page_html = page.content()
+            const fullText = document.body.innerText || '';
+
+            // Name
+            const name = getText('h1') || getText('.org-top-card-summary__title');
+
+            // Description
+            const desc = getText('.org-about-us-organization-description__text') ||
+                         getText('[data-test-id="about-us__description"]') ||
+                         getText('.org-about-module__description') ||
+                         getText('section.about-us p');
+
+            // Website
+            const webEl = document.querySelector('a[data-control-name="visit_company_website"]') ||
+                          document.querySelector('.org-about-us-organization-description a[href*="http"]');
+            const website = webEl ? webEl.href : '';
+
+            // Followers
+            const followerMatch = fullText.match(/([\\d,]+)\\s*follower/i);
+            const followers = followerMatch ? parseInt(followerMatch[1].replace(/,/g,'')) : '';
+
+            // Employee count
+            const empMatch = fullText.match(/(\\d[\\d,]*\\s*[-–]\\s*\\d[\\d,]*|\\d[\\d,]+\\+?)\\s*employees?/i);
+            const employee_count = empMatch ? empMatch[0].trim() : '';
+
+            // Specialties
+            const specEl = document.querySelector('.org-about-us-organization-description__text--specialties');
+            const specialties = specEl ? specEl.innerText.split(',').map(s=>s.trim()).filter(Boolean) : [];
+
+            // Founded / HQ from about page dl list
+            const details = {};
+            document.querySelectorAll('dl dt, dl dd').forEach((el, i, arr) => {
+                if (el.tagName === 'DT') {
+                    const key = el.innerText.trim().toLowerCase();
+                    const val = arr[i+1] ? arr[i+1].innerText.trim() : '';
+                    details[key] = val;
+                }
+            });
+
+            return { name, description: desc, website, followers, employee_count,
+                     specialties, details };
+        }
+        """)
+
         browser.close()
 
-    # Parse HTML fallback
-    try:
-        from scrapling.parser import Adaptor
-        page_obj = Adaptor(page_html, auto_match=False)
-        html_data = _parse_company_html(page_obj)
-        company.update(html_data)
-    except Exception:
-        pass
+    if data:
+        profile["name"] = data.get("name", "")
+        profile["description"] = data.get("description", "")
+        profile["website"] = data.get("website", "")
+        profile["followers"] = data.get("followers", "")
+        profile["employee_count"] = data.get("employee_count", "")
+        profile["specialties"] = data.get("specialties", [])
+        details = data.get("details", {})
+        profile["headquarters"] = details.get("headquarters", "") or details.get("sede", "")
+        profile["founded"] = details.get("founded", "") or details.get("fundada", "")
+        profile["industry"] = details.get("industry", "") or details.get("sector", "")
 
-    # Overlay with Voyager data (higher quality)
-    if voyager_profile:
-        voyager_parsed = _parse_company_voyager_profile(voyager_profile)
-        company.update({k: v for k, v in voyager_parsed.items() if v})
-
-    return company
+    return {k: v for k, v in profile.items() if v or v == 0}
 
 
 def bulk_enrich_companies(
@@ -428,12 +547,11 @@ def bulk_enrich_companies(
     delay: float = 3.0,
 ) -> list[dict]:
     """
-    Enrich a list of company stubs (from search_companies) with full profiles.
-    Adds: description, website, employee_count, headquarters, founded, specialties.
+    Enrich a list of company stubs with full profiles (website, description, etc).
 
     Args:
-        companies:  List of dicts with at least 'linkedin_url'
-        delay:      Seconds between requests (respect rate limits)
+        companies: List of dicts with at least 'linkedin_url'
+        delay:     Seconds between requests to avoid rate limiting
 
     Returns:
         List of enriched company dicts
@@ -448,11 +566,10 @@ def bulk_enrich_companies(
             enriched.append(c)
             continue
 
-        console.print(f"  [{i+1}/{len(companies)}] Enriching: [cyan]{c.get('name', url)}[/cyan]")
+        console.print(f"  [{i+1}/{len(companies)}] [cyan]{c.get('name', url)}[/cyan]")
         try:
             profile = get_company_profile(url, cookies=cookies, headless=headless)
-            merged = {**c, **profile}
-            enriched.append(merged)
+            enriched.append({**c, **profile})
         except Exception as e:
             console.print(f"    [red]Error:[/red] {e}")
             enriched.append(c)

@@ -321,37 +321,171 @@ def search_people(
 
         page = context.new_page()
 
-        def on_response(response):
-            url = response.url
-            if "voyager/api/search/blended" in url or "voyager/api/search/cluster" in url:
-                try:
-                    body = response.body()
-                    data = json.loads(body)
-                    hits = _parse_voyager_people_search(data)
-                    captured.extend(hits)
-                    console.print(f"  [green]Voyager:[/green] +{len(hits)} profiles (total {len(captured)})")
-                except Exception:
-                    pass
-
-        page.on("response", on_response)
-
         console.print(f"  [dim]Searching people:[/dim] {base_search[:80]}...")
-        page.goto(base_search, wait_until="domcontentloaded", timeout=60000)
-        page.wait_for_timeout(3000)
-        time.sleep(wait_seconds)
+        try:
+            page.goto(base_search, wait_until="domcontentloaded", timeout=60000)
+        except Exception:
+            pass
 
-        pages_loaded = 1
-        while len(captured) < count and pages_loaded < 5:
-            for _ in range(4):
+        if "login" in page.url or "authwall" in page.url:
+            console.print("[red]LinkedIn redirigió al login — sesión expirada.[/red]")
+            browser.close()
+            return []
+
+        # Smart wait: try known selectors first, then fall back to fixed sleep
+        result_selectors = [
+            "li.reusable-search__result-container",
+            "li[class*='result-container']",
+            ".entity-result",
+            ".search-results-container li",
+        ]
+        for sel in result_selectors:
+            try:
+                page.wait_for_selector(sel, timeout=12000)
+                break
+            except Exception:
+                continue
+        else:
+            for _ in range(3):
+                page.evaluate("window.scrollBy(0, 600)")
+                time.sleep(1.5)
+            time.sleep(max(wait_seconds - 4, 3))
+
+        time.sleep(2)  # Let JS fully populate cards
+
+        def _extract_people_from_page(pg) -> list[dict]:
+            return pg.evaluate("""
+            () => {
+                const people = [];
+                const getText = (el) => {
+                    if (!el) return '';
+                    const h = el.querySelector('span[aria-hidden="true"]') ||
+                               el.querySelector('span[aria-hidden]');
+                    return (h ? h.innerText : el.innerText || '').trim();
+                };
+                const cleanUrl = (href) => href ? href.split('?')[0].replace(/\\/$/, '') : '';
+
+                // Strategy 1: known card containers
+                const cardSelectors = [
+                    'li.reusable-search__result-container',
+                    'li[class*="result-container"]',
+                    '.entity-result',
+                    '[data-view-name="search-entity-result-universal-template"]',
+                    '.search-results-container > ul > li',
+                ];
+                let cards = [];
+                for (const sel of cardSelectors) {
+                    cards = Array.from(document.querySelectorAll(sel));
+                    if (cards.length > 0) break;
+                }
+
+                if (cards.length > 0) {
+                    cards.forEach(card => {
+                        const linkEl = card.querySelector('a[href*="/in/"]');
+                        if (!linkEl) return;
+                        const href = cleanUrl(linkEl.href);
+                        const name = getText(linkEl) || getText(card.querySelector('h3, h4'));
+                        if (!name || name.length < 2) return;
+
+                        const sub1 = card.querySelector(
+                            '.entity-result__primary-subtitle, [class*="primary-subtitle"]'
+                        );
+                        const sub2 = card.querySelector(
+                            '.entity-result__secondary-subtitle, [class*="secondary-subtitle"]'
+                        );
+                        people.push({
+                            name, linkedin_url: href,
+                            headline: sub1 ? sub1.innerText.trim() : '',
+                            location: sub2 ? sub2.innerText.trim() : '',
+                            profile_id: '', snippet: '', source: 'dom_card',
+                        });
+                    });
+                    if (people.length > 0) return people;
+                }
+
+                // Strategy 2: find /in/ links — accept li OR div containers
+                const SKIP_UI = new Set(['Conectar', 'Connect', 'Seguir', 'Follow',
+                                          'Mensaje', 'Message', 'Pending', '·', '•']);
+                const root = document.querySelector('.scaffold-layout__main') ||
+                             document.querySelector('main') || document.body;
+                const seen = new Set();
+                root.querySelectorAll('a[href*="/in/"]').forEach(link => {
+                    const href = cleanUrl(link.href);
+                    if (!href || seen.has(href)) return;
+                    if (link.closest('nav,header,footer,aside')) return;
+                    // Skip messaging and undefined profile links
+                    if (href.endsWith('/messaging') || href.includes('/in/undefined')) return;
+                    // Only top-level profile URLs (no sub-paths)
+                    const tail = href.replace(/.*\\/in\\/[^/]+/, '');
+                    if (tail && tail.length > 1) return;
+                    seen.add(href);
+                    const name = getText(link);
+                    if (!name || name.length < 2 || name.length > 80) return;
+                    // Container: accept li or div
+                    const container = link.closest('li') ||
+                                      link.closest('div[class]') ||
+                                      link.parentElement;
+                    let headline = '', location = '';
+                    if (container) {
+                        const leaves = [];
+                        container.querySelectorAll('span,div,p').forEach(el => {
+                            const childElems = Array.from(el.children).filter(
+                                c => !['SPAN','A','B','EM'].includes(c.tagName));
+                            if (childElems.length > 0) return;
+                            const t = el.innerText.trim();
+                            if (t && t !== name && t.length > 2 && t.length < 120 &&
+                                !SKIP_UI.has(t) && !t.includes('\\n')) leaves.push(t);
+                        });
+                        const uniq = [...new Set(leaves)];
+                        headline = uniq[0] || '';
+                        location = uniq[1] || '';
+                    }
+                    people.push({ name, linkedin_url: href, headline, location,
+                                  profile_id: '', snippet: '', source: 'dom_link' });
+                });
+                return people;
+            }
+            """) or []
+
+        batch = _extract_people_from_page(page)
+        if batch:
+            captured.extend(batch)
+            console.print(f"  [green]Página 1:[/green] +{len(batch)} perfiles")
+        else:
+            # Scroll and retry once
+            for _ in range(5):
                 page.evaluate("window.scrollBy(0, window.innerHeight)")
-                time.sleep(random.uniform(1.0, 2.0))
-
-            next_btn = page.query_selector("button[aria-label='Next']")
-            if next_btn:
-                next_btn.click()
-                time.sleep(random.uniform(3.0, 5.0))
-                pages_loaded += 1
+                time.sleep(1.5)
+            batch = _extract_people_from_page(page)
+            if batch:
+                captured.extend(batch)
+                console.print(f"  [green]Tras scroll:[/green] +{len(batch)} perfiles")
             else:
+                title = page.title()
+                snippet = page.evaluate("() => document.body.innerText.slice(0, 300)")
+                console.print(f"  [dim]Título: {title}[/dim]")
+                console.print(f"  [dim]Página: {snippet!r}[/dim]")
+
+        # Paginate
+        page_num = 1
+        while len(captured) < count and page_num < 8:
+            try:
+                next_btn = page.query_selector("button[aria-label='Next']")
+                if not next_btn:
+                    next_url = base_search + f"&page={page_num + 1}"
+                    page.goto(next_url, wait_until="domcontentloaded", timeout=30000)
+                    time.sleep(wait_seconds)
+                else:
+                    next_btn.click()
+                    time.sleep(random.uniform(3, 5))
+                batch = _extract_people_from_page(page)
+                if not batch:
+                    break
+                captured.extend(batch)
+                console.print(f"  [green]Página {page_num + 1}:[/green] +{len(batch)} (total {len(captured)})")
+                page_num += 1
+            except Exception as e:
+                console.print(f"  [dim]Paginación detenida: {e}[/dim]")
                 break
 
         browser.close()
@@ -359,11 +493,11 @@ def search_people(
     # Deduplicate
     seen: set[str] = set()
     unique: list[dict] = []
-    for p in captured:
-        key = p.get("profile_id") or p["name"].lower().strip()
-        if key not in seen:
+    for prof in captured:
+        key = prof.get("profile_id") or prof.get("linkedin_url") or prof.get("name", "").lower().strip()
+        if key and key not in seen:
             seen.add(key)
-            unique.append(p)
+            unique.append(prof)
 
     console.print(f"  [bold green]Profiles found:[/bold green] {len(unique)}")
     return unique[:count]
@@ -400,9 +534,7 @@ def get_person_profile(
         linkedin_url = f"https://www.linkedin.com/in/{linkedin_url}"
 
     profile: dict = {"linkedin_url": linkedin_url, "source": "person_profile"}
-    voyager_identity: dict = {}
-    voyager_positions: dict = {}
-    page_html: str = ""
+    dom_data: dict = {}
 
     with sync_playwright() as p:
         browser = p.chromium.launch(headless=headless)
@@ -419,59 +551,99 @@ def get_person_profile(
 
         page = context.new_page()
 
-        def on_response(response):
-            url = response.url
-            if "voyager/api/identity/profiles" in url and "/profileView" not in url:
-                try:
-                    data = json.loads(response.body())
-                    voyager_identity.update(data)
-                except Exception:
-                    pass
-            if "voyager/api/identity/profiles" in url and "positions" in url:
-                try:
-                    data = json.loads(response.body())
-                    voyager_positions.update(data)
-                except Exception:
-                    pass
+        try:
+            page.goto(linkedin_url, wait_until="domcontentloaded", timeout=60000)
+        except Exception:
+            pass
 
-        page.on("response", on_response)
-        page.goto(linkedin_url, wait_until="domcontentloaded", timeout=60000)
-        page.wait_for_timeout(3000)
-
-        # Scroll to trigger experience section load
-        if include_experience:
-            for _ in range(5):
-                page.evaluate("window.scrollBy(0, window.innerHeight)")
-                time.sleep(random.uniform(0.8, 1.5))
+        # Scroll to trigger lazy-loaded sections
+        for _ in range(5 if include_experience else 2):
+            page.evaluate("window.scrollBy(0, window.innerHeight)")
+            time.sleep(random.uniform(0.8, 1.5))
 
         time.sleep(wait_seconds)
-        page_html = page.content()
+
+        # Extract via DOM evaluation
+        dom_data = page.evaluate("""
+        () => {
+            const getText = (sel) => {
+                const el = document.querySelector(sel);
+                if (!el) return '';
+                const h = el.querySelector('span[aria-hidden="true"]') ||
+                           el.querySelector('span[aria-hidden]');
+                return (h ? h.innerText : el.innerText || '').trim();
+            };
+            const getAllText = (sel) => Array.from(document.querySelectorAll(sel))
+                .map(e => {
+                    const h = e.querySelector('span[aria-hidden="true"]');
+                    return (h ? h.innerText : e.innerText || '').trim();
+                }).filter(Boolean);
+            const body = document.body.innerText || '';
+
+            // Name
+            const name = getText('h1') || getText('.pv-text-details__left-panel h1');
+
+            // Headline
+            const headline = getText('.pv-text-details__left-panel .text-body-medium') ||
+                             getText('[data-generated-suggestion-target]') ||
+                             getText('.top-card-layout__headline');
+
+            // Location
+            const location = getText('.pv-text-details__left-panel .text-body-small[class*="break-words"]') ||
+                             getText('.top-card__subline-item');
+
+            // About / summary
+            const summary = getText('#about ~ div .visually-hidden') ||
+                            getText('.pv-shared-text-with-see-more .visually-hidden') ||
+                            getText('.summary');
+
+            // Connections
+            const connMatch = body.match(/([\\d,]+)\\s*connections?/i);
+            const connections = connMatch ? connMatch[1].replace(/,/g,'') : '';
+
+            // Current company from experience section
+            const expSections = document.querySelectorAll(
+                '[id="experience"] ~ div li, ' +
+                '.pvs-list__item--line-separated'
+            );
+            let current_title = '', current_company = '';
+            if (expSections.length > 0) {
+                const first = expSections[0];
+                const spans = Array.from(first.querySelectorAll('span[aria-hidden="true"]'))
+                    .map(s => s.innerText.trim()).filter(Boolean);
+                current_title = spans[0] || '';
+                current_company = spans[1] || '';
+            }
+
+            // Experience items
+            const experience = [];
+            expSections.forEach((sec, i) => {
+                if (i >= 10) return;
+                const spans = Array.from(sec.querySelectorAll('span[aria-hidden="true"]'))
+                    .map(s => s.innerText.trim()).filter(Boolean);
+                if (spans[0]) {
+                    experience.push({
+                        title: spans[0] || '',
+                        company: spans[1] || '',
+                        date_range: spans[2] || '',
+                        description: '',
+                    });
+                }
+            });
+
+            return { name, headline, location, summary, connections,
+                     current_title, current_company, experience };
+        }
+        """)
+
         browser.close()
 
-    # Parse HTML fallback
-    try:
-        from scrapling.parser import Adaptor
-        page_obj = Adaptor(page_html, auto_match=False)
-        html_data = _parse_profile_html(page_obj)
-        profile.update(html_data)
-    except Exception:
-        pass
+    if dom_data:
+        profile.update({k: v for k, v in dom_data.items() if v and k != "experience"})
+        if include_experience and dom_data.get("experience"):
+            profile["experience"] = dom_data["experience"]
 
-    # Overlay Voyager identity
-    if voyager_identity:
-        voyager_data = _parse_profile_voyager(voyager_identity)
-        profile.update({k: v for k, v in voyager_data.items() if v})
-
-    # Parse experience
-    if include_experience and voyager_positions:
-        positions = _parse_experience_voyager(voyager_positions)
-        if positions:
-            profile["experience"] = positions
-            if positions and not profile.get("current_title"):
-                profile["current_title"] = positions[0].get("title", "")
-                profile["current_company"] = positions[0].get("company", "")
-
-    return profile
+    return {k: v for k, v in profile.items() if v or v == 0}
 
 
 def build_recruiting_list(
